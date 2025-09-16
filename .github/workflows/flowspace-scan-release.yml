@@ -1,0 +1,275 @@
+name: Flowspace Scan and Release
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Required for creating releases
+  pull-requests: write  # For PR comments
+  actions: read  # For workflow status
+
+concurrency:
+  group: flowspace-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    env:
+
+      FLOWSPACE_AZURE_OPENAI_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY || 'no-key' }}
+      FLOWSPACE_AZURE_EMBEDDING_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY || 'no-key' }}
+      AZURE_OPENAI_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY || 'no-key' }}
+      AZURE_EMBEDDING_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY || 'no-key' }}
+      
+      # LLM Configuration
+      FLOWSPACE_LLM__PROVIDER: ${{ vars.FLOWSPACE_LLM__PROVIDER || 'azure' }}
+      FLOWSPACE_LLM__BASE_URL: ${{ vars.FLOWSPACE_LLM__BASE_URL || 'https://your-deployment.openai.azure.com/' }}
+      FLOWSPACE_LLM__AZURE_DEPLOYMENT_NAME: ${{ vars.FLOWSPACE_LLM__AZURE_DEPLOYMENT_NAME || 'model-router' }}
+      FLOWSPACE_LLM__MODEL: ${{ vars.FLOWSPACE_LLM__MODEL || 'model-router' }}
+      FLOWSPACE_LLM__API_KEY: "${AZURE_OPENAI_API_KEY}"
+      # Embedding Configuration  
+      FLOWSPACE_EMBEDDING__MODE: ${{ vars.FLOWSPACE_EMBEDDING__MODE || 'azure' }}      
+      # Azure Embedding Settings
+      FLOWSPACE_EMBEDDING__AZURE__ENDPOINT: ${{ vars.FLOWSPACE_EMBEDDING__AZURE__ENDPOINT || 'https://your-deployment.openai.azure.com/' }}
+      FLOWSPACE_EMBEDDING__AZURE__MODEL: ${{ vars.FLOWSPACE_EMBEDDING__AZURE__MODEL || 'text-embedding-3-small' }}
+      FLOWSPACE_EMBEDDING__AZURE__API_KEY: "${AZURE_OPENAI_API_KEY}"
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Install Flowspace
+        id: flowspace-setup
+        run: |
+          echo "🚀 Installing flowspace using ez installer..."
+          curl -L https://aka.ms/InstallFlowspace bash
+          
+          # Add flowspace to PATH for this session
+          export PATH="/root/.local/bin:$PATH"
+          echo "/root/.local/bin" >> $GITHUB_PATH
+          
+          # Show available commands
+          flowspace --help || true
+          echo "✅ Flowspace installed successfully"
+                
+      - name: Find Recent Successful Run
+        id: find-run
+        run: |
+          echo "🔍 Looking for previous successful workflow runs..."
+          
+          # Find the most recent successful run that has our artifact
+          RECENT_RUN=$(gh run list --workflow=flowspace-scan-release.yml --status=completed --limit=10 --json databaseId,conclusion | jq -r '.[] | select(.conclusion == "success") | .databaseId' | head -1)
+          
+          if [ -n "$RECENT_RUN" ]; then
+            echo "📦 Found recent successful run: $RECENT_RUN"
+            echo "run-id=${RECENT_RUN}" >> $GITHUB_OUTPUT
+            echo "found=true" >> $GITHUB_OUTPUT
+          else
+            echo "📝 No previous successful runs found"
+            echo "This might be the first successful run - continuing with fresh scan..."
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Initialize Flowspace (if needed)
+        run: |
+          echo "🔍 Checking if flowspace needs initialization..."
+          
+          # Check if .flowspace/config.yaml exists
+          if [ ! -f ".flowspace/config.yaml" ]; then
+            echo "� Config file not found, running flowspace init..."
+            flowspace init
+            echo "✅ Flowspace initialized successfully"
+          else
+            echo "✅ Flowspace already initialized (config.yaml exists)"
+          fi          
+          
+          # Create registry.yaml for clean multi-repo state
+          echo "� Creating registry.yaml for clean repository state..."
+          cat > .flowspace/registry.yaml << EOF
+          version: '1.0'
+          repositories: {}
+          default_repo: null
+          EOF
+          
+          # Show the configuration being used
+          echo "� Test configuration created:"
+          cat .flowspace/config.yaml
+          echo "📋 Registry configuration created:"
+          cat .flowspace/registry.yaml
+
+      - name: Download Previous Scan Results
+        if: steps.find-run.outputs.found == 'true'
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: flowspace-condensed-latest
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-run.outputs.run-id }}
+          path: ./previous-scan/
+
+      - name: Restore Previous Condensed Files
+        run: |
+          echo "🔍 Checking for previous condensed files..."
+          
+          if [ -f "./previous-scan/condensed.tar.gz" ]; then
+            echo "📦 Found previous condensed.tar.gz, extracting..."
+            mkdir -p .flowspace/output/lfl
+            
+            # Extract to temporary location first
+            mkdir -p ./temp-extract
+            cd ./temp-extract
+            
+            if tar -xzf ../previous-scan/condensed.tar.gz 2>/dev/null; then
+              echo "✅ Successfully extracted previous archive"
+              
+              # Copy LFL file if it exists
+              if [ -f "./lfl/condensed.jsonl" ]; then
+                if cp "./lfl/condensed.jsonl" "../.flowspace/output/lfl/condensed.jsonl" 2>/dev/null; then
+                  echo "� Restoring LFL condensed.jsonl..."
+                  echo "- LFL file size: $(du -h ../.flowspace/output/lfl/condensed.jsonl | cut -f1 2>/dev/null || echo 'unknown')"
+                  echo "✅ Previous scan results restored successfully"
+                  
+                  # Add the restored condensed file to flowspace repository
+                  echo "📦 Adding condensed file to flowspace repository..."
+                  cd ..
+                  if flowspace repo add main .flowspace/output/lfl/condensed.jsonl; then
+                    echo "✅ Condensed file added to flowspace repository successfully"
+                  else
+                    echo "⚠️ Failed to add condensed file to flowspace repository, continuing with scan"
+                  fi
+                  cd ./temp-extract
+                else
+                  echo "⚠️ Failed to copy LFL condensed.jsonl, continuing with fresh scan"
+                fi
+              else
+                echo "📝 No LFL condensed.jsonl found in archive, continuing with fresh scan"
+              fi
+            else
+              echo "⚠️ Failed to extract previous archive, continuing with fresh scan"
+            fi
+            
+            cd ..
+            rm -rf ./temp-extract 2>/dev/null || true
+          else
+            echo "� No previous condensed files found, starting fresh scan"
+          fi
+      
+      - name: Run Flowspace Full Scan
+        timeout-minutes: 60
+        run: |
+          echo "🔍 Starting flowspace full-scan..."
+          echo "LLM Provider: ${FLOWSPACE_LLM__PROVIDER}"
+          echo "LLM Base URL: ${FLOWSPACE_LLM__BASE_URL}"
+          echo "LLM Model: ${FLOWSPACE_LLM__MODEL}"
+          echo "Embedding Mode: ${FLOWSPACE_EMBEDDING__MODE}"
+          echo "Embedding Endpoint: ${FLOWSPACE_EMBEDDING__AZURE__ENDPOINT}"
+          echo "Embedding Model: ${FLOWSPACE_EMBEDDING__AZURE__MODEL}"
+
+          # Run the full scan using default folders
+          flowspace full-scan
+          
+          echo "✅ Full scan completed successfully"
+          
+          # Debug: Show what files were actually created
+          echo "🔍 Checking scan output locations..."
+          echo "Contents of .flowspace/:"
+          ls -la .flowspace/ || echo "No .flowspace directory"
+          echo "Contents of .flowspace/output/:"
+          ls -la .flowspace/output/ || echo "No .flowspace/output directory"
+          echo "Contents of .flowspace/output/lfl/:"
+          ls -la .flowspace/output/lfl/ || echo "No .flowspace/output/lfl directory"
+          
+          # Show scan results
+          echo "📊 Scan Results:"
+          if [ -f ".flowspace/output/lfl/condensed.jsonl" ]; then
+            echo "- LFL condensed.jsonl size: $(du -h .flowspace/output/lfl/condensed.jsonl | cut -f1)"
+            echo "- LFL condensed.jsonl lines: $(wc -l .flowspace/output/lfl/condensed.jsonl | cut -d' ' -f1)"
+          else
+            echo "⚠️ No LFL condensed.jsonl found in .flowspace/output/lfl/"
+          fi
+      
+      - name: Create Condensed Archive
+        if: success()
+        run: |
+          echo "📦 Creating condensed archive..."
+          
+          # Create a clean directory structure for the archive
+          mkdir -p ./archive-temp/lfl
+          
+          # Copy LFL condensed file from output location
+          if [ -f ".flowspace/output/lfl/condensed.jsonl" ]; then
+            echo "📋 Found LFL condensed.jsonl in .flowspace/output/lfl/"
+            cp ".flowspace/output/lfl/condensed.jsonl" "./archive-temp/lfl/condensed.jsonl"
+            echo "✅ LFL condensed.jsonl added to archive"
+          else
+            echo "❌ LFL condensed.jsonl not found in .flowspace/output/lfl/"
+            echo "Checking all possible locations:"
+            find .flowspace -name "condensed.jsonl" -type f 2>/dev/null || echo "No condensed.jsonl files found"
+            exit 1
+          fi
+          
+          # Create the tar.gz archive
+          cd archive-temp
+          tar -czf ../condensed.tar.gz .
+          cd ..
+          
+          # Show archive info
+          echo "📊 Archive created:"
+          echo "- Size: $(du -h condensed.tar.gz | cut -f1)"
+          echo "- Contents:"
+          tar -tzf condensed.tar.gz | sed 's/^/  - /'
+          
+          # Cleanup temp directory
+          rm -rf archive-temp
+
+      - name: Upload Condensed Results
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: flowspace-condensed-latest
+          path: condensed.tar.gz
+          retention-days: 30
+      
+      - name: Job Summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 📊 Flowspace Scan Summary
+          
+          | Status | Detail |
+          |--------|--------|
+          | **Scan Result** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |
+          | **Repository** | ${{ github.repository }} |
+          | **Branch** | ${{ github.head_ref }} |
+          | **Commit** | ${{ github.event.pull_request.head.sha }} |
+          | **LLM Provider** | ${{ env.FLOWSPACE_LLM__PROVIDER }} |
+          | **Embedding Mode** | ${{ env.FLOWSPACE_EMBEDDING__MODE }} |
+          
+          ### Configuration Used
+          - Flowspace Version: ${{ steps.flowspace-setup.outputs.version || 'N/A' }}
+          - Default folders: `.flowspace/lfl/`
+          - Configuration: Auto-initialized if needed
+          
+          ### Artifacts Generated
+          EOF
+          
+          # Add artifact information if scan was successful
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "- ✅ Condensed results uploaded as \`flowspace-condensed-latest\`" >> $GITHUB_STEP_SUMMARY
+            echo "- 📦 Archive contains: LFL condensed.jsonl file" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔄 Next build will use this for incremental updates" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ Scan failed - no artifacts generated" >> $GITHUB_STEP_SUMMARY
+          fi
