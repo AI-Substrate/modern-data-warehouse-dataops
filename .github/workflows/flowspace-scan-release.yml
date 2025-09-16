@@ -51,7 +51,7 @@ jobs:
         id: flowspace-setup
         run: |
           echo "🚀 Installing flowspace using ez installer..."
-          curl -L https://aka.ms/InstallFlowspace bash
+          curl -L https://aka.ms/InstallFlowspace | bash
           
           # Add flowspace to PATH for this session
           export PATH="/root/.local/bin:$PATH"
